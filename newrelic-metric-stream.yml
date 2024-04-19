@@ -1,0 +1,161 @@
+ AWSTemplateFormatVersion: 2010-09-09
+Description: Configures New Relic IAM Roles, CloudWatch metric stream and Kinesis Data Firehose to send metrics to New Relic with a scalable naming scheme to support multi-account/region scaling via StackSets. The NewRelicInfrastrucutre-Integrations role used for Billing will only be deployed in us-east-1 region, so modify as needed if that region is not within scope. 
+Mappings:
+  DatacenterMap:
+    NewRelicDatacenter:
+      US: 'https://aws-api.newrelic.com/cloudwatch-metrics/v1'
+      EU: 'https://aws-api.eu01.nr-data.net/cloudwatch-metrics/v1'
+Parameters:
+  NewRelicLicenseKey:
+    Type: String
+    Description: 40-character hexadecimal string
+    NoEcho: true
+    MaxLength: 40
+  NewRelicDatacenter:
+    Type: String
+    Description: EU keys are prefixed with eu0x, US otherwise
+    Default: US
+    AllowedValues: [US, EU]
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: 'Metric Stream Configuration'
+        Parameters:
+          - NewRelicLicenseKey
+          - NewRelicDatacenter
+    ParameterLabels:
+      NewRelicDatacenter:
+        default: 'New Relic Datacenter'
+      NewRelicLicenseKey:
+        default: 'New Relic Ingest License Key'
+Conditions:
+  IsUSEast1Region: !Equals [ !Ref "AWS::Region", "us-east-1" ]
+Resources:
+  NRIntegrationRole:
+    Type: "AWS::IAM::Role"
+    Condition: IsUSEast1Region
+    Properties:
+      Path: "/"
+      ManagedPolicyArns:
+      - "arn:aws:iam::aws:policy/ReadOnlyAccess"
+      MaxSessionDuration: 3600
+      Description: ""
+      Policies:
+      - PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Resource: "*"
+            Action:
+            - "budgets:ViewBudget"
+            Effect: "Allow"
+        PolicyName: "NewRelicBudget"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Condition:
+            StringEquals:
+              sts:ExternalId: "78209"
+          Action: "sts:AssumeRole"
+          Effect: "Allow"
+          Principal:
+            AWS: "arn:aws:iam::754728514883:root"
+      RoleName: 'NewRelicInfrastructure-Integrations'
+  NRMetricStreamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - streams.metrics.cloudwatch.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref AWS::AccountId
+      Path: /service-role/
+      Policies:
+        - PolicyName: MetricStreams-FirehosePutRecords
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'firehose:PutRecord'
+                  - 'firehose:PutRecordBatch'
+                Resource: !GetAtt NRFirehoseStream.Arn
+      Description: Role to allow a metric stream put metrics into a firehose
+      RoleName: !Sub 'NewRelic-MetricStreamRole-${AWS::AccountId}-${AWS::Region}'
+  NRFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - firehose.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /service-role/
+      Policies:
+        - PolicyName: Firehose-S3Access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:AbortMultipartUpload'
+                  - 's3:GetBucketLocation'
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                  - 's3:ListBucketMultipartUploads'
+                  - 's3:PutObject'
+                Resource:
+                  - !GetAtt NRS3FirehoseEventsBucket.Arn
+                  - !Join ['', [!GetAtt NRS3FirehoseEventsBucket.Arn, '/*']]
+      Description: Role to allow firehose stream put events into S3 backup bucket
+      RoleName: !Sub 'NewRelic-FirehoseRole-${AWS::AccountId}-${AWS::Region}'
+  NRS3FirehoseEventsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'newrelic-firehose-backup-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  NRFirehoseStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub 'NewRelic-Firehose-${AWS::AccountId}-${AWS::Region}'
+      DeliveryStreamType: DirectPut
+      HttpEndpointDestinationConfiguration:
+        RequestConfiguration:
+          ContentEncoding: GZIP
+        EndpointConfiguration:
+          Name: New Relic
+          Url: !FindInMap [DatacenterMap, NewRelicDatacenter, !Ref NewRelicDatacenter]
+          AccessKey: !Ref NewRelicLicenseKey
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 1
+        RetryOptions:
+          DurationInSeconds: 60
+        S3Configuration:
+          CompressionFormat: GZIP
+          BucketARN: !GetAtt NRS3FirehoseEventsBucket.Arn
+          RoleARN: !GetAtt NRFirehoseRole.Arn
+        RoleARN: !GetAtt NRFirehoseRole.Arn
+  NRCloudWatchMetricStream:
+    Type: AWS::CloudWatch::MetricStream
+    Properties:
+      Name: !Sub 'NewRelic-MetricStream-${AWS::AccountId}-${AWS::Region}'
+      FirehoseArn: !GetAtt NRFirehoseStream.Arn
+      RoleArn: !GetAtt NRMetricStreamRole.Arn
+      OutputFormat: 'opentelemetry0.7'
